@@ -3,6 +3,7 @@ package cache
 import (
 	"container/list"
 	"context"
+	"fmt"
 	"sync"
 	"time"
 )
@@ -169,6 +170,77 @@ type loadCall struct {
 	gen    uint64
 }
 
+// startProbeLocked starts a loader invocation whose result is never
+// published to the store automatically. Combined reads (Snapshot and
+// View.Refresh) use probes: the loaded values stay provisional until
+// the whole group passes the dependency-consistency boundary and is
+// committed atomically. A probe never registers in inflight, so it
+// cannot be joined by ordinary Gets and a discarded candidate leaves
+// nothing behind in the cache. The loader still runs detached from
+// the caller's cancellation, mirroring shared loads.
+func (c *Cache) startProbeLocked(ctx context.Context, key string) *loadCall {
+	call := &loadCall{done: make(chan struct{}), gen: c.generations[key]}
+	c.stats.Loads++
+	loadCtx := context.WithoutCancel(ctx)
+	go func() {
+		res, err := c.loader(loadCtx, key)
+		c.mu.Lock()
+		call.result, call.err = res, err
+		close(call.done)
+		c.mu.Unlock()
+	}()
+	return call
+}
+
+// commitGroupLocked publishes an entire consistent group at once. It
+// only runs while the caller holds c.mu. Every key must still be at
+// the generation observed when the group was loaded, and no newer
+// source version may have become known through another load; otherwise
+// the whole group is rejected so provisional values can never overwrite
+// confirmed state piece by piece. It returns the store events to emit
+// after unlocking and the entries evicted by the resulting writes.
+func (c *Cache) commitGroupLocked(results map[string]SourceResult,
+	gens map[string]uint64) (ok bool, reason string,
+	events []Event, evicted []evictedEntry) {
+	for k := range results {
+		if c.generations[k] != gens[k] {
+			return false, "superseded: key " + k +
+				" was invalidated while the group was loading", nil, nil
+		}
+	}
+	for k, res := range results {
+		if res.Version < c.sourceVersions[k] {
+			return false, fmt.Sprintf("superseded: key %s loaded at source version %d, %d already known",
+				k, res.Version, c.sourceVersions[k]), nil, nil
+		}
+	}
+	for k, res := range results {
+		e := Entry{
+			Value:         res.Value,
+			Version:       gens[k],
+			SourceVersion: res.Version,
+			Deps:          res.Deps,
+		}
+		if c.ttl > 0 {
+			e.ExpiresAt = time.Now().Add(c.ttl)
+		}
+		c.setDepsLocked(k, res.Deps)
+		c.store.Set(k, e)
+		c.sourceVersions[k] = res.Version
+		c.touchLocked(k)
+		events = append(events, Event{Key: k, Op: EventStored,
+			Reason: "loaded", SourceVersion: res.Version})
+	}
+	evicted = c.evictLocked()
+	return true, "", events, evicted
+}
+
+// evictedEntry pairs an evicted key with its former entry.
+type evictedEntry struct {
+	key   string
+	entry Entry
+}
+
 // Get returns the value for key, loading it on a miss. Concurrent Gets
 // for the same key share a single loader invocation.
 func (c *Cache) Get(ctx context.Context, key string) (any, error) {
@@ -223,10 +295,7 @@ func (c *Cache) startLoadLocked(ctx context.Context, key string) *loadCall {
 func (c *Cache) runLoad(ctx context.Context, key string, call *loadCall) {
 	res, err := c.loader(ctx, key)
 	var events []Event
-	var evicted []struct {
-		key   string
-		entry Entry
-	}
+	var evicted []evictedEntry
 	c.mu.Lock()
 	if err == nil {
 		switch {
@@ -407,14 +476,8 @@ func (c *Cache) removeLocked(key string) {
 }
 
 // evictLocked drops least-recently-used entries until within capacity.
-func (c *Cache) evictLocked() []struct {
-	key   string
-	entry Entry
-} {
-	var out []struct {
-		key   string
-		entry Entry
-	}
+func (c *Cache) evictLocked() []evictedEntry {
+	var out []evictedEntry
 	if c.capacity <= 0 {
 		return out
 	}
@@ -427,10 +490,7 @@ func (c *Cache) evictLocked() []struct {
 		e, _ := c.store.Get(key)
 		c.removeLocked(key)
 		c.stats.Evictions++
-		out = append(out, struct {
-			key   string
-			entry Entry
-		}{key, e})
+		out = append(out, evictedEntry{key, e})
 	}
 	return out
 }
