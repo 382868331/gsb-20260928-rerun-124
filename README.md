@@ -32,10 +32,21 @@
 - 刷新期读旧值：`AllowStale` 开启后，过期条目先返回旧值，同时后台刷新。
 - 容量淘汰：超出 `Capacity` 时按 LRU 淘汰，`OnEvict` 回调与
   `Stats.Evictions` 提供可检查的淘汰行为。
+- 组合读取视图（`view.go`）：`Snapshot` 把多个相互依赖的键在同一
+  次加锁下捕获为可保留的 `View`，每项记录来源业务版本
+  （`SourceVersion`），未完成或失败的部分以 `ItemPending` /
+  `ItemFailed` 连同错误显式标出。已交付的视图不可变：后来的刷新
+  不会改变它，重复读取恒定；新视图能拿到最新值，两个视图可按键
+  对比来源版本来解释差异。
+- 候选刷新：`View.Refresh` 产出可查看的 `Candidate`。部分来源失败
+  时原视图保留、候选中的部分变化仍可查看，但只有全部成员就绪且
+  视图内依赖边全部满足时 `Adopt` 才正式采用；等待者中途退出
+  （`waiter-left`）或来源在候选加载期间再次变化（`superseded`）
+  都让候选进入明确的 `CandidateAborted` 去向。候选只是数据，不
+  持有锁、加载任务或 goroutine，丢弃后不留占用。
 
 ## 验证
 
 ```sh
 go test -race ./...
 ```
-
