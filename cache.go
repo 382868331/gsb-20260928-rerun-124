@@ -126,7 +126,11 @@ type Cache struct {
 	// it; invalidation propagates along these edges.
 	dependents map[string]map[string]struct{}
 	inflight   map[string]*loadCall
-	stats      Stats
+	// probes holds in-flight tentative loads. They are kept apart from
+	// inflight so a committing Get never joins a load whose result will
+	// not be published, while tentative readers share one another's loads.
+	probes map[string]*loadCall
+	stats  Stats
 }
 
 // New builds a Cache. The loader is required.
@@ -157,6 +161,7 @@ func New(opts Options) *Cache {
 		sourceVersions: make(map[string]uint64),
 		dependents:     make(map[string]map[string]struct{}),
 		inflight:       make(map[string]*loadCall),
+		probes:         make(map[string]*loadCall),
 	}
 }
 
@@ -167,6 +172,10 @@ type loadCall struct {
 	result SourceResult
 	err    error
 	gen    uint64
+	// tentative loads deliver their result to waiters but never commit
+	// it to the public store. They belong to a candidate/combined read
+	// that publishes its whole member set atomically on adoption.
+	tentative bool
 }
 
 // Get returns the value for key, loading it on a miss. Concurrent Gets
@@ -206,69 +215,60 @@ func (c *Cache) Get(ctx context.Context, key string) (any, error) {
 // new waiters must not join it, so a fresh load takes its place (the old
 // one still finishes and is dropped on commit).
 func (c *Cache) startLoadLocked(ctx context.Context, key string) *loadCall {
+	return c.startLoadKindLocked(ctx, key, false)
+}
+
+// startProbeLocked joins or starts a tentative load for key. Tentative
+// loads never commit: their result exists only for the candidate or
+// combined read that started them, so an unadopted candidate cannot
+// leak fresh values into the public store.
+func (c *Cache) startProbeLocked(ctx context.Context, key string) *loadCall {
+	return c.startLoadKindLocked(ctx, key, true)
+}
+
+func (c *Cache) startLoadKindLocked(ctx context.Context, key string, tentative bool) *loadCall {
 	gen := c.generations[key]
-	if call, ok := c.inflight[key]; ok && call.gen == gen {
+	table := c.inflight
+	if tentative {
+		table = c.probes
+	}
+	if call, ok := table[key]; ok && call.gen == gen {
 		return call
 	}
-	call := &loadCall{done: make(chan struct{}), gen: gen}
-	c.inflight[key] = call
+	// A committing load must not share a tentative call (its result
+	// would never be stored), and vice versa: keep the two tables apart.
+	call := &loadCall{done: make(chan struct{}), gen: gen, tentative: tentative}
+	table[key] = call
 	c.stats.Loads++
 	// Detach from the caller's cancellation: the load belongs to all
 	// current and future waiters, not to whoever happened to start it.
 	loadCtx := context.WithoutCancel(ctx)
-	go c.runLoad(loadCtx, key, call)
+	go c.runLoad(loadCtx, key, call, tentative)
 	return call
 }
 
-func (c *Cache) runLoad(ctx context.Context, key string, call *loadCall) {
+func (c *Cache) runLoad(ctx context.Context, key string, call *loadCall, tentative bool) {
 	res, err := c.loader(ctx, key)
+	c.mu.Lock()
 	var events []Event
 	var evicted []struct {
 		key   string
 		entry Entry
 	}
-	c.mu.Lock()
-	if err == nil {
-		switch {
-		case c.generations[key] != call.gen:
-			// Key was invalidated while loading: the stale result
-			// must not overwrite the newer state.
-			c.stats.StaleDrops++
-			events = append(events, Event{Key: key, Op: EventDropped,
-				Reason:        "invalidated-during-load",
-				SourceVersion: res.Version})
-		case res.Version < c.sourceVersions[key]:
-			// A read of an older source snapshot finished late.
-			// Local generations say nothing about source freshness,
-			// so compare against the known source version instead.
-			c.stats.OldSourceDrops++
-			events = append(events, Event{Key: key, Op: EventDropped,
-				Reason:        "older-source-version",
-				SourceVersion: res.Version})
-		default:
-			e := Entry{
-				Value:         res.Value,
-				Version:       call.gen,
-				SourceVersion: res.Version,
-				Deps:          res.Deps,
-			}
-			if c.ttl > 0 {
-				e.ExpiresAt = time.Now().Add(c.ttl)
-			}
-			c.setDepsLocked(key, res.Deps)
-			c.store.Set(key, e)
-			c.sourceVersions[key] = res.Version
-			c.touchLocked(key)
-			evicted = c.evictLocked()
-			events = append(events, Event{Key: key, Op: EventStored,
-				Reason:        "loaded",
-				SourceVersion: res.Version})
+	if tentative {
+		// Tentative results belong to the caller's candidate only.
+		// They must not touch the store, source-version marker, stats
+		// or dependency index; adoption replays them through publishLocked.
+		if c.probes[key] == call {
+			delete(c.probes, key)
+		}
+	} else {
+		events, evicted = c.commitResultLocked(key, call.gen, res, err)
+		if c.inflight[key] == call {
+			delete(c.inflight, key)
 		}
 	}
 	call.result, call.err = res, err
-	if c.inflight[key] == call {
-		delete(c.inflight, key)
-	}
 	close(call.done)
 	c.mu.Unlock()
 	c.emit(events)
@@ -277,6 +277,106 @@ func (c *Cache) runLoad(ctx context.Context, key string, call *loadCall) {
 			c.onEvict(ev.key, ev.entry)
 		}
 	}
+}
+
+// commitResultLocked applies one finished load to the public store
+// under the same rules for every read entry point: stale generations and
+// older source versions are dropped, otherwise the entry is stored.
+func (c *Cache) commitResultLocked(key string, gen uint64, res SourceResult, err error) ([]Event, []struct {
+	key   string
+	entry Entry
+}) {
+	var events []Event
+	var evicted []struct {
+		key   string
+		entry Entry
+	}
+	if err != nil {
+		return nil, nil
+	}
+	switch {
+	case c.generations[key] != gen:
+		// Key was invalidated while loading: the stale result must not
+		// overwrite the newer state.
+		c.stats.StaleDrops++
+		events = append(events, Event{Key: key, Op: EventDropped,
+			Reason:        "invalidated-during-load",
+			SourceVersion: res.Version})
+	case res.Version < c.sourceVersions[key]:
+		// A read of an older source snapshot finished late. Local
+		// generations say nothing about source freshness, so compare
+		// against the known source version instead.
+		c.stats.OldSourceDrops++
+		events = append(events, Event{Key: key, Op: EventDropped,
+			Reason:        "older-source-version",
+			SourceVersion: res.Version})
+	default:
+		evicted = c.storeResultLocked(key, gen, res)
+		events = append(events, Event{Key: key, Op: EventStored,
+			Reason:        "loaded",
+			SourceVersion: res.Version})
+	}
+	return events, evicted
+}
+
+// storeResultLocked writes one fully validated result to the store.
+func (c *Cache) storeResultLocked(key string, gen uint64, res SourceResult) []struct {
+	key   string
+	entry Entry
+} {
+	e := Entry{
+		Value:         res.Value,
+		Version:       gen,
+		SourceVersion: res.Version,
+		Deps:          res.Deps,
+	}
+	if c.ttl > 0 {
+		e.ExpiresAt = time.Now().Add(c.ttl)
+	}
+	c.setDepsLocked(key, res.Deps)
+	c.store.Set(key, e)
+	c.sourceVersions[key] = res.Version
+	c.touchLocked(key)
+	return c.evictLocked()
+}
+
+// pendingResult is one member of a combined read waiting to be
+// published together with the rest of its set.
+type pendingResult struct {
+	res SourceResult
+	gen uint64
+}
+
+// publishResultsLocked commits a full combined set atomically. Callers
+// must already have verified every member's generation and source
+// version plus the in-set dependency boundary. Storing the members one
+// after another without a prior boundary check would let another reader
+// observe a new root stitched onto an old leaf, so combined reads must
+// publish only through here.
+func (c *Cache) publishResultsLocked(results map[string]pendingResult) ([]Event, []struct {
+	key   string
+	entry Entry
+}) {
+	var events []Event
+	for key, pr := range results {
+		e := Entry{
+			Value:         pr.res.Value,
+			Version:       pr.gen,
+			SourceVersion: pr.res.Version,
+			Deps:          pr.res.Deps,
+		}
+		if c.ttl > 0 {
+			e.ExpiresAt = time.Now().Add(c.ttl)
+		}
+		c.setDepsLocked(key, pr.res.Deps)
+		c.store.Set(key, e)
+		c.sourceVersions[key] = pr.res.Version
+		c.touchLocked(key)
+		events = append(events, Event{Key: key, Op: EventStored,
+			Reason:        "loaded",
+			SourceVersion: pr.res.Version})
+	}
+	return events, c.evictLocked()
 }
 
 // Invalidate marks key stale and bumps its local generation, so any load
@@ -347,6 +447,9 @@ func (c *Cache) Refresh(ctx context.Context, key string) bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if _, ok := c.inflight[key]; ok {
+		return false
+	}
+	if _, ok := c.probes[key]; ok {
 		return false
 	}
 	c.startLoadLocked(ctx, key)
