@@ -100,6 +100,10 @@ type Options struct {
 	// OnEvent is called (without the cache lock held) for every store,
 	// drop and invalidation, with the reason for the decision.
 	OnEvent func(Event)
+	// Journal, when set, durably records every confirmed combined view
+	// and every candidate decision, so a restart can restore and
+	// explain the last published combination. See Restore.
+	Journal Journal
 }
 
 // Cache organises keys, versions and load tasks on top of a Store.
@@ -131,6 +135,15 @@ type Cache struct {
 	// not be published, while tentative readers share one another's loads.
 	probes map[string]*loadCall
 	stats  Stats
+
+	// jmu guards the journal sequence, the last append error and the
+	// last confirmed record. It is never held while c.mu is needed for
+	// more than reading fields already captured by the caller.
+	jmu        sync.Mutex
+	journal    Journal
+	journalSeq uint64
+	journalErr error
+	confirmed  *JournalRecord
 }
 
 // New builds a Cache. The loader is required.
@@ -162,6 +175,7 @@ func New(opts Options) *Cache {
 		dependents:     make(map[string]map[string]struct{}),
 		inflight:       make(map[string]*loadCall),
 		probes:         make(map[string]*loadCall),
+		journal:        opts.Journal,
 	}
 }
 

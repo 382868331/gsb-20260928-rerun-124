@@ -75,6 +75,7 @@ func (c *Cache) Snapshot(ctx context.Context, keys ...string) *View {
 	items := make(map[string]ViewItem, len(order))
 	deps := make(map[string][]string, len(order))
 	pending := make(map[string]pendingResult)
+	gens := make(map[string]uint64, len(order))
 	superseded := false
 	c.mu.Lock()
 	for _, k := range order {
@@ -85,6 +86,7 @@ func (c *Cache) Snapshot(ctx context.Context, keys ...string) *View {
 				items[k] = ViewItem{Key: k, State: ItemReady, Value: e.Value,
 					SourceVersion: e.SourceVersion}
 				deps[k] = e.Deps
+				gens[k] = e.Version
 			} else {
 				items[k] = ViewItem{Key: k, State: ItemFailed,
 					Err: fmt.Errorf("entry unavailable at capture time")}
@@ -113,6 +115,7 @@ func (c *Cache) Snapshot(ctx context.Context, keys ...string) *View {
 						items[k] = ViewItem{Key: k, State: ItemReady, Value: e.Value,
 							SourceVersion: e.SourceVersion}
 						deps[k] = e.Deps
+						gens[k] = e.Version
 						continue
 					}
 				}
@@ -126,6 +129,7 @@ func (c *Cache) Snapshot(ctx context.Context, keys ...string) *View {
 				items[k] = ViewItem{Key: k, State: ItemReady,
 					Value: res.Value, SourceVersion: res.Version}
 				deps[k] = res.Deps
+				gens[k] = call.gen
 				pending[k] = pendingResult{res: res, gen: call.gen}
 			}
 		}
@@ -149,6 +153,12 @@ func (c *Cache) Snapshot(ctx context.Context, keys ...string) *View {
 	}
 	c.mu.Unlock()
 	c.emit(events)
+	if len(events) > 0 {
+		// The combined set crossed the boundary and was published:
+		// record the confirmed view durably before anyone can restart
+		// and wonder which combination was last public.
+		c.appendRecord(RecordConfirmed, "snapshot", order, items, deps, gens)
+	}
 	for _, ev := range evicted {
 		if c.onEvict != nil {
 			c.onEvict(ev.key, ev.entry)
@@ -310,13 +320,15 @@ func (v *View) Refresh(ctx context.Context) *Candidate {
 				items[k] = ViewItem{Key: k, State: ItemPending, Err: ctx.Err()}
 			}
 		}
-		return &Candidate{
+		cand := &Candidate{
 			base: v,
 			view: &View{c: c, order: append([]string(nil), keys...), items: items},
 			deps: deps, gens: gens, pending: pending,
 			state:  CandidateAborted,
 			reason: "waiter-left: " + ctx.Err().Error(),
 		}
+		c.appendRecord(RecordCandidate, cand.reason, keys, items, deps, gens)
+		return cand
 	}
 
 	c.mu.Lock()
@@ -366,6 +378,12 @@ func (v *View) Refresh(ctx context.Context) *Candidate {
 	default:
 		cand.state = CandidateReady
 	}
+	if cand.state != CandidateReady {
+		// Failed and aborted candidates are persisted for audit: their
+		// would-be values stay inspectable after a restart but are
+		// never restored into the public store.
+		c.appendRecord(RecordCandidate, cand.reason, keys, items, deps, gens)
+	}
 	return cand
 }
 
@@ -407,12 +425,16 @@ func (cand *Candidate) Adopt() (view *View, ok bool) {
 			c.mu.Unlock()
 			cand.state = CandidateAborted
 			cand.reason = "superseded: a source changed again before adoption"
+			c.appendRecord(RecordCandidate, cand.reason, cand.view.order,
+				cand.view.items, cand.deps, cand.gens)
 			return cand.base, false
 		}
 		if known := c.sourceVersions[k]; known > it.SourceVersion {
 			c.mu.Unlock()
 			cand.state = CandidateAborted
 			cand.reason = "superseded: a newer source version was confirmed before adoption"
+			c.appendRecord(RecordCandidate, cand.reason, cand.view.order,
+				cand.view.items, cand.deps, cand.gens)
 			return cand.base, false
 		}
 	}
@@ -424,6 +446,7 @@ func (cand *Candidate) Adopt() (view *View, ok bool) {
 	cand.view.deps = cand.deps
 	c.mu.Unlock()
 	c.emit(events)
+	c.appendRecord(RecordConfirmed, "adopt", cand.view.order, cand.view.items, cand.deps, cand.gens)
 	for _, ev := range evicted {
 		if c.onEvict != nil {
 			c.onEvict(ev.key, ev.entry)
@@ -438,6 +461,8 @@ func (cand *Candidate) Abandon() {
 	if cand.state != CandidateAborted {
 		cand.state = CandidateAborted
 		cand.reason = "abandoned by caller"
+		cand.base.c.appendRecord(RecordCandidate, cand.reason, cand.view.order,
+			cand.view.items, cand.deps, cand.gens)
 	}
 }
 
